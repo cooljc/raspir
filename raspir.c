@@ -29,6 +29,7 @@
 #include <linux/types.h>  /* size_t */
 #include <linux/completion.h>
 #include <linux/uaccess.h>
+#include <linux/device.h>
 
 #include "raspir.h"
 
@@ -50,9 +51,9 @@ static int gpio_out_pin = 4;
 /* enable debugging messages */
 static int debug = 1;
 
-
 static int raspir_major = 0;
 static unsigned long driver_open;
+static struct class *raspir_class = 0;
 
 /*
  * Open and close.
@@ -117,11 +118,18 @@ struct file_operations raspir_fops = {
   .unlocked_ioctl = raspir_ioctl,
 };
 
+void raspir_cleanup(void)
+{
+  if (raspir_class) {
+    device_destroy(raspir_class, MKDEV(raspir_major, 0));
+    class_destroy(raspir_class);
+  }
+  unregister_chrdev(raspir_major, RASPIR_DRIVER_NAME);
+}
 
 int raspir_init(void)
 {
   int result;
-
   /*
    * Register your major, and accept a dynamic number
    */
@@ -131,17 +139,21 @@ int raspir_init(void)
   if (raspir_major == 0)
     raspir_major = result; /* dynamic */
 
-  /* Print so info out */
-  dprintk ("I was assigned major number %d. To talk to\n", raspir_major);
-  dprintk ("the driver, create a dev file with\n");
-  dprintk ("'mknod /dev/%s c %d 0'.\n", RASPIR_DRIVER_NAME, raspir_major);
-  
-  return 0;
-}
+  raspir_class = class_create(THIS_MODULE, RASPIR_DRIVER_NAME);
+  if (IS_ERR(raspir_class)) {
+    result = PTR_ERR(raspir_class);
+    goto fail;
+  }
 
-void raspir_cleanup(void)
-{
-  unregister_chrdev(raspir_major, RASPIR_DRIVER_NAME);
+  /* create device in /dev/ directory */
+  device_create(raspir_class, NULL, MKDEV(raspir_major, 0), NULL, "%s", RASPIR_DRIVER_NAME);
+  dprintk ("device created: /dev/raspir\n");
+
+  return 0;
+
+ fail:
+  raspir_cleanup ();
+  return result;
 }
 
 module_init(raspir_init);
