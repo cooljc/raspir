@@ -30,10 +30,18 @@
 #include <linux/completion.h>
 #include <linux/uaccess.h>
 #include <linux/device.h>
+#include <linux/gpio.h>
+#include <linux/delay.h>
 
 #include "raspir.h"
 
 #define RASPIR_DRIVER_NAME "raspir"
+
+#ifndef MAX_UDELAY_MS
+#define MAX_UDELAY_US 5000
+#else
+#define MAX_UDELAY_US (MAX_UDELAY_MS*1000)
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Debug MACRO used to print data to syslog. */
@@ -63,6 +71,188 @@ static int debug = 1;
 static int raspir_major = 0;
 static unsigned long driver_open;
 static struct class *raspir_class = 0;
+struct gpio_chip *gpiochip;
+
+/* =================================================================
+ * Matsushita Kaseikyo protocol:
+ *
+ * +--------+--------------+---------+
+ * | Leader | 48 Data Bits | Trailer |
+ * +--------+--------------+---------+
+ *
+ *         +----------+
+ * Leader: |    8T    |  4T
+ *         +          +------+
+ *
+ *          +---+
+ * Trailer: | T |  171T
+ *          +   +----------....----+
+ *
+ * Data bits
+ *          +---+
+ * Logic 1: | T |   3T
+ *          +   +---------+
+ *
+ *          +---+
+ * Logic 0: | T | T
+ *          +   +---+
+ *
+ * T = 436uS
+ * Pulse: 50/50 duty cycle
+ * ================================================================== */
+#define T_DELAY 14
+
+static void safe_udelay(unsigned long usecs)
+{
+  while (usecs > MAX_UDELAY_US) {
+    udelay(MAX_UDELAY_US);
+    usecs -= MAX_UDELAY_US;
+  }
+  udelay(usecs);
+}
+
+static void raspir_t_on (unsigned char t)
+{
+  unsigned char loop=0;
+  unsigned char pulse=0;
+
+  for (loop=0; loop<t; loop++) {
+    for (pulse=0; pulse<16; pulse++) {
+      /* IR On */
+      gpiochip->set(gpiochip, gpio_out_pin, 1);
+      /* Wait T/32 */
+      safe_udelay (T_DELAY);
+      /* IR Off */
+      gpiochip->set(gpiochip, gpio_out_pin, 0);
+      /* Wait T/32 */
+      safe_udelay (T_DELAY);
+    }
+  }
+}
+
+static void raspir_t_off (unsigned char t)
+{
+  unsigned long delay = (t * (T_DELAY*32));
+  /* delay */
+  safe_udelay (delay);
+}
+
+static void raspir_send_bit (unsigned char bit)
+{
+  if ( (bit & 0x01) == 1) {
+    raspir_t_on  (1);
+    raspir_t_off (3);
+  }
+  else {
+    raspir_t_on  (1);
+    raspir_t_off (1);
+  }
+}
+
+static void raspir_send_byte (unsigned char byte, unsigned char lsbFirst)
+{
+  unsigned char loop=0;
+  for (loop=0; loop<8; loop++) {
+    if (!lsbFirst)
+      raspir_send_bit ( ((byte >> (8-(loop+1)) ) & 0x01) );
+    else
+      raspir_send_bit ( ((byte >> loop)& 0x01) );
+  }
+}
+
+void raspir_send_command (unsigned short manid, unsigned short equip_code, unsigned char data_code)
+{
+  unsigned char bytes[6];
+  unsigned char loop;
+
+  bytes[1] = (unsigned char)(manid & 0xff);              /* MAKER_CODE_PANA_HB */
+  bytes[0] = (unsigned char)((manid >> 8) & 0xff);       /* MAKER_CODE_PANA_LB */
+
+  bytes[3] = (unsigned char)(equip_code & 0xff);         /* parity+equip_code */
+  bytes[2] = (unsigned char)((equip_code >> 8) & 0xff);  /* equip_code */
+  bytes[4] = data_code;                                  /* data code */
+  bytes[5] = (bytes[2] ^ bytes[3] ^ bytes[4]);           /* checksum */
+
+  /* send leader */
+  raspir_t_on (8);
+  raspir_t_off (4);
+
+  /* send Bytes */
+  for (loop=0; loop<6; loop++) {
+    raspir_send_byte (bytes[loop], 1);
+  }
+  /* send trailer */
+  raspir_t_on (1);
+  raspir_t_off (171);
+}
+
+/* ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
+static int raspir_is_right_chip(struct gpio_chip *chip, void *data)
+{
+  dprintk("raspir_is_right_chip %s %d\n", chip->label,
+	  strcmp(data, chip->label));
+
+  if (strcmp(data, chip->label) == 0)
+    return 1;
+  return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
+static int raspir_init_port(void)
+{
+  int ret;
+
+  gpiochip = gpiochip_find("bcm2708_gpio", raspir_is_right_chip);
+
+  if (!gpiochip)
+    return -ENODEV;
+
+  if (gpio_request(gpio_out_pin, RASPIR_DRIVER_NAME " ir/out")) {
+    printk(KERN_ALERT RASPIR_DRIVER_NAME
+	   ": cant claim gpio pin %d\n", gpio_out_pin);
+    ret = -ENODEV;
+    goto exit_init_port;
+  }
+
+  if (gpio_request(gpio_in_pin, RASPIR_DRIVER_NAME " ir/in")) {
+    printk(KERN_ALERT RASPIR_DRIVER_NAME
+	   ": cant claim gpio pin %d\n", gpio_in_pin);
+    ret = -ENODEV;
+    goto exit_gpio_free_out_pin;
+  }
+
+  gpiochip->direction_input(gpiochip, gpio_in_pin);
+  gpiochip->direction_output(gpiochip, gpio_out_pin, 1);
+  gpiochip->set(gpiochip, gpio_out_pin, 0);
+
+#ifdef RECEIVER_ENABLED
+  irq = gpiochip->to_irq(gpiochip, gpio_in_pin);
+  dprintk("to_irq %d\n", irq);
+  irqdata = irq_get_irq_data(irq);
+
+  if (irqdata && irqdata->chip) {
+    irqchip = irqdata->chip;
+  } else {
+    ret = -ENODEV;
+    goto exit_gpio_free_in_pin;
+  }
+#endif
+
+  return 0;
+
+#ifdef RECEIVER_ENABLED
+ exit_gpio_free_in_pin:
+  gpio_free(gpio_in_pin);
+#endif
+
+ exit_gpio_free_out_pin:
+  gpio_free(gpio_out_pin);
+
+ exit_init_port:
+  return ret;
+}
 
 /* ------------------------------------------------------------------ */
 /* raspir_open()
@@ -124,6 +314,9 @@ static long raspir_ioctl (struct file *file, unsigned int cmd,
 	       ir_cmd.m_equipment_code,
 	       ir_cmd.m_ir_code,
 	       ir_cmd.m_repeat);
+      raspir_send_command (ir_cmd.m_manufacturer_id,
+			   ir_cmd.m_equipment_code,
+			   ir_cmd.m_ir_code);
     }
     break;
   }
@@ -147,10 +340,17 @@ struct file_operations raspir_fops = {
 /* ------------------------------------------------------------------ */
 void raspir_cleanup(void)
 {
+  /* remove /dev/raspir */
   if (raspir_class) {
     device_destroy(raspir_class, MKDEV(raspir_major, 0));
     class_destroy(raspir_class);
   }
+
+  /* free GPIO pins */
+  gpio_free(gpio_out_pin);
+  gpio_free(gpio_in_pin);
+
+  /* unregister char device */
   unregister_chrdev(raspir_major, RASPIR_DRIVER_NAME);
 }
 
@@ -169,6 +369,11 @@ int raspir_init(void)
     return result;
   if (raspir_major == 0)
     raspir_major = result; /* dynamic */
+
+  /* claim GPIO pins */
+  result = raspir_init_port();
+  if (result < 0)
+    goto fail;
 
   raspir_class = class_create(THIS_MODULE, RASPIR_DRIVER_NAME);
   if (IS_ERR(raspir_class)) {
