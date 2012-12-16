@@ -387,6 +387,10 @@ static int raspir_open(struct inode *inode, struct file *file)
 static int raspir_release(struct inode *inode, struct file *file)
 {
   kthread_stop(ir_tx_task);
+  /* reset pointers */
+  ir_tx_rptr = 0;
+  ir_tx_wptr = 0;
+  ir_tx_count = 0;
   clear_bit(0, &driver_open);
   return 0;
 }
