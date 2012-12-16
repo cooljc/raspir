@@ -32,6 +32,8 @@
 #include <linux/device.h>
 #include <linux/gpio.h>
 #include <linux/delay.h>
+#include <linux/mutex.h>
+#include <linux/kthread.h>
 
 #include "raspir.h"
 
@@ -102,7 +104,70 @@ struct gpio_chip *gpiochip;
  * ================================================================== */
 #define T_DELAY 14
 
-static void safe_udelay(unsigned long usecs)
+#define RASPIR_TX_BUF_SIZE 10
+static unsigned int ir_tx_count = 0;
+static unsigned int ir_tx_wptr = 0;
+static unsigned int ir_tx_rptr = 0;
+static raspir_command_t ir_tx_buf[RASPIR_TX_BUF_SIZE];
+static struct mutex ir_tx_lock;
+static struct task_struct *ir_tx_task;
+
+/* ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
+static int raspir_add_tx_command (raspir_command_t *cmd)
+{
+  int ret = 0;
+  /* lock mutex */
+  mutex_lock (&ir_tx_lock);
+  /* check tx count */
+  if (ir_tx_count == RASPIR_TX_BUF_SIZE)
+    goto add_tx_done;
+  /* add new command to queue */
+  memcpy (&ir_tx_buf[ir_tx_wptr], cmd, sizeof(raspir_command_t));
+  /* increment write pointer */
+  if( ++ir_tx_wptr == RASPIR_TX_BUF_SIZE) {
+    ir_tx_wptr = 0;
+  }
+  /* increment ir count */
+  ir_tx_count++;
+  /* set return flag to indicate success */
+  ret = 1;
+  
+ add_tx_done:
+  /* unlock mutex */
+  mutex_unlock (&ir_tx_lock);
+  return ret;
+}
+
+/* ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
+static int raspir_get_tx_command (raspir_command_t *cmd)
+{
+  int ret = 0;
+  /* lock mutex */
+  mutex_lock (&ir_tx_lock);
+  /* check count */
+  if (ir_tx_count == 0)
+    goto get_tx_done;
+  /* get next command in queue */
+  memcpy (cmd, &ir_tx_buf[ir_tx_rptr], sizeof(raspir_command_t));
+  /* increment read pointer */
+  if (++ir_tx_rptr == RASPIR_TX_BUF_SIZE) {
+    ir_tx_rptr = 0;
+  }
+  /* decrement ir_tx_count */
+  ir_tx_count--;
+  /* set return flag to indicate we are returning a command */
+  ret = 1;
+ get_tx_done:
+  /* unlock mutex */
+  mutex_unlock (&ir_tx_lock);
+  return ret;
+}
+
+/* ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
+static void raspir_udelay(unsigned long usecs)
 {
   while (usecs > MAX_UDELAY_US) {
     udelay(MAX_UDELAY_US);
@@ -111,6 +176,8 @@ static void safe_udelay(unsigned long usecs)
   udelay(usecs);
 }
 
+/* ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
 static void raspir_t_on (unsigned char t)
 {
   unsigned char loop=0;
@@ -121,22 +188,26 @@ static void raspir_t_on (unsigned char t)
       /* IR On */
       gpiochip->set(gpiochip, gpio_out_pin, 1);
       /* Wait T/32 */
-      safe_udelay (T_DELAY);
+      raspir_udelay (T_DELAY);
       /* IR Off */
       gpiochip->set(gpiochip, gpio_out_pin, 0);
       /* Wait T/32 */
-      safe_udelay (T_DELAY);
+      raspir_udelay (T_DELAY);
     }
   }
 }
 
+/* ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
 static void raspir_t_off (unsigned char t)
 {
   unsigned long delay = (t * (T_DELAY*32));
   /* delay */
-  safe_udelay (delay);
+  raspir_udelay (delay);
 }
 
+/* ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
 static void raspir_send_bit (unsigned char bit)
 {
   if ( (bit & 0x01) == 1) {
@@ -149,6 +220,8 @@ static void raspir_send_bit (unsigned char bit)
   }
 }
 
+/* ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
 static void raspir_send_byte (unsigned char byte, unsigned char lsbFirst)
 {
   unsigned char loop=0;
@@ -160,6 +233,8 @@ static void raspir_send_byte (unsigned char byte, unsigned char lsbFirst)
   }
 }
 
+/* ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
 void raspir_send_command (unsigned short manid, unsigned short equip_code, unsigned char data_code)
 {
   unsigned char bytes[6];
@@ -184,6 +259,34 @@ void raspir_send_command (unsigned short manid, unsigned short equip_code, unsig
   /* send trailer */
   raspir_t_on (1);
   raspir_t_off (171);
+}
+
+/* ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
+static int raspir_tx_thread (void *args)
+{
+  raspir_command_t cmd;
+
+  dprintk("raspir_tx_thread started\n");
+  do {
+    if (raspir_get_tx_command(&cmd)) {
+      int loop;
+      for (loop=0; loop<cmd.m_repeat; loop++) {
+	raspir_send_command(cmd.m_manufacturer_id,
+			   cmd.m_equipment_code,
+			   cmd.m_ir_code);
+      }
+      if (kthread_should_stop())
+	break;
+    }
+    else {
+      set_current_state(TASK_INTERRUPTIBLE);
+      schedule();
+    }
+  } while (!kthread_should_stop());
+
+  dprintk("raspir_tx_thread ended\n");
+  return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -265,6 +368,14 @@ static int raspir_open(struct inode *inode, struct file *file)
   if (test_and_set_bit(0, &driver_open))
     return -EBUSY;
   
+  /* try to fire up polling thread */
+  ir_tx_task = kthread_run(raspir_tx_thread, NULL, RASPIR_DRIVER_NAME);
+  if (IS_ERR(ir_tx_task)) {
+    dprintk("cannot run ir_tx_thread thread\n");
+    clear_bit(0, &driver_open);
+    return -ECHILD;
+  }
+
   return nonseekable_open(inode, file);
 }
 
@@ -275,6 +386,7 @@ static int raspir_open(struct inode *inode, struct file *file)
 /* ------------------------------------------------------------------ */
 static int raspir_release(struct inode *inode, struct file *file)
 {
+  kthread_stop(ir_tx_task);
   clear_bit(0, &driver_open);
   return 0;
 }
@@ -314,9 +426,13 @@ static long raspir_ioctl (struct file *file, unsigned int cmd,
 	       ir_cmd.m_equipment_code,
 	       ir_cmd.m_ir_code,
 	       ir_cmd.m_repeat);
+#if 0
       raspir_send_command (ir_cmd.m_manufacturer_id,
 			   ir_cmd.m_equipment_code,
 			   ir_cmd.m_ir_code);
+#else
+      raspir_add_tx_command(&ir_cmd);
+#endif
     }
     break;
   }
@@ -374,6 +490,9 @@ int raspir_init(void)
   result = raspir_init_port();
   if (result < 0)
     goto fail;
+
+  /* initialize mutex */
+  mutex_init(&ir_tx_lock);
 
   raspir_class = class_create(THIS_MODULE, RASPIR_DRIVER_NAME);
   if (IS_ERR(raspir_class)) {
