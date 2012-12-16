@@ -1,0 +1,1 @@
+KERNEL=="raspir",  MODE="0666", GROUP="root", NAME="raspir"
