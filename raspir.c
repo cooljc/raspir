@@ -35,6 +35,9 @@
 
 #define RASPIR_DRIVER_NAME "raspir"
 
+/* ------------------------------------------------------------------ */
+/* Debug MACRO used to print data to syslog. */
+/* ------------------------------------------------------------------ */
 #define dprintk(fmt, args...)					\
   do {								\
     if (debug)							\
@@ -42,8 +45,11 @@
 	     fmt, ## args);					\
   } while (0)
 
-/* module parameters */
 
+/* ------------------------------------------------------------------ */
+/* module parameters passed in via modprobe or insmod when module is
+ * loaded */
+/* ------------------------------------------------------------------ */
 /* set the default GPIO input pin */
 static int gpio_in_pin = 18;
 /* set the default GPIO output pin */
@@ -51,14 +57,19 @@ static int gpio_out_pin = 4;
 /* enable debugging messages */
 static int debug = 1;
 
+/* ------------------------------------------------------------------ */
+/* Global variables required for driver operation. */
+/* ------------------------------------------------------------------ */
 static int raspir_major = 0;
 static unsigned long driver_open;
 static struct class *raspir_class = 0;
 
-/*
- * Open and close.
- */
-
+/* ------------------------------------------------------------------ */
+/* raspir_open()
+ * This function is called form userland using open(). If successful
+ * it will return a file descriptor that can be used with ioctl() and
+ * close() system functions. */
+/* ------------------------------------------------------------------ */
 static int raspir_open(struct inode *inode, struct file *file)
 {
   if (test_and_set_bit(0, &driver_open))
@@ -67,12 +78,22 @@ static int raspir_open(struct inode *inode, struct file *file)
   return nonseekable_open(inode, file);
 }
 
+/* ------------------------------------------------------------------ */
+/* raspir_release()
+ * This function is called from userland using close() on an open
+ * file descriptor. */
+/* ------------------------------------------------------------------ */
 static int raspir_release(struct inode *inode, struct file *file)
 {
   clear_bit(0, &driver_open);
   return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* raspir_ioctl()
+ * This function is called from userland using ioctl() on an open
+ * file descriptor to /dev/raspir. */
+/* ------------------------------------------------------------------ */
 static long raspir_ioctl (struct file *file, unsigned int cmd, 
 			  unsigned long arg)
 {
@@ -110,7 +131,9 @@ static long raspir_ioctl (struct file *file, unsigned int cmd,
   return ret;
 }
 
-
+/* ------------------------------------------------------------------ */
+/* Define modules file operations. */
+/* ------------------------------------------------------------------ */
 struct file_operations raspir_fops = {
   .owner          = THIS_MODULE,
   .open           = raspir_open,
@@ -118,6 +141,10 @@ struct file_operations raspir_fops = {
   .unlocked_ioctl = raspir_ioctl,
 };
 
+/* ------------------------------------------------------------------ */
+/* raspir_cleanup()
+ * This function is called when the module is removed or init fails.  */
+/* ------------------------------------------------------------------ */
 void raspir_cleanup(void)
 {
   if (raspir_class) {
@@ -127,6 +154,10 @@ void raspir_cleanup(void)
   unregister_chrdev(raspir_major, RASPIR_DRIVER_NAME);
 }
 
+/* ------------------------------------------------------------------ */
+/* raspir_init()
+ * This function is called when the module is inserted/loaded. */
+/* ------------------------------------------------------------------ */
 int raspir_init(void)
 {
   int result;
@@ -156,9 +187,14 @@ int raspir_init(void)
   return result;
 }
 
+/* ------------------------------------------------------------------ */
+/* register module load/exit functions */
+/* ------------------------------------------------------------------ */
 module_init(raspir_init);
 module_exit(raspir_cleanup);
 
+/* ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
 MODULE_DESCRIPTION("Panasonic Infra-red receiver and blaster driver for Raspberry Pi GPIO.");
 MODULE_AUTHOR("Jon Cross <joncross.cooljc@gmail.com>");
 MODULE_LICENSE("GPL");
